@@ -138,7 +138,7 @@ public:
                    const std::string& split,
                    const std::string& data_root,
                    bool master_process = true,
-                   size_t max_tokens_per_shard = 100000000)
+                   size_t max_tokens_per_shard = 199818240)
         : B_(B), T_(T),
           rank_(rank), world_(world_size),
           split_(split), root_(data_root),
@@ -235,15 +235,15 @@ private:
 // ============================================================================
 
 struct GPTConfig {
-    int context_length = 256;  // Reduced for testing
+    int context_length = 1024;  // Reduced for testing
     int vocab_size = 50304;
-    int n_embd = 384;          // Reduced for testing
+    int n_embd = 384;          // Reduced for faster testing
     int n_layers = 6;
 
-    float max_lr = 5e-4f;
-    float min_lr = 5e-5f;
-    int warmup_steps = 100;
-    int max_steps = 100;
+    float max_lr = 1e-4f;      // Stable LR for training with embeddings
+    float min_lr = 1e-5f;
+    int warmup_steps = 1200;
+    int max_steps = 12196;
 };
 
 // ============================================================================
@@ -289,7 +289,7 @@ public:
 class GPT : public Module {
 public:
     GPT(GPTConfig config) : config(config) {
-        // Initialize embedding weights on CPU - keep on CPU for lookup
+        // Initialize embedding weights on CPU, will be moved to GPU
         std::vector<float> wte_data(config.vocab_size * config.n_embd);
         std::vector<float> wpe_data(config.context_length * config.n_embd);
         
@@ -298,19 +298,19 @@ public:
         for(auto& w : wte_data) w = dist(rng);
         for(auto& w : wpe_data) w = dist(rng);
         
-        // Token embedding - keep on CPU (require_grad=false since we won't train embeddings for now)
+        // Token embedding - requires_grad=true for training
         Tensor wte_t = Tensor(Shape{{static_cast<int64_t>(config.vocab_size), static_cast<int64_t>(config.n_embd)}}, 
-                              Dtype::Float32, Device::CPU, false);  // no grad for simplicity
+                              Dtype::Float32, Device::CPU, true);  // requires_grad=true
         std::copy(wte_data.begin(), wte_data.end(), wte_t.data<float>());
         wte = make_tensor(wte_t, "wte");
-        // Don't add to params_ - embeddings stay on CPU
+        params_.push_back(wte);  // Add to trainable params
         
-        // Positional embedding - keep on CPU
+        // Positional embedding - requires_grad=true for training
         Tensor wpe_t = Tensor(Shape{{static_cast<int64_t>(config.context_length), static_cast<int64_t>(config.n_embd)}}, 
-                              Dtype::Float32, Device::CPU, false);  // no grad for simplicity
+                              Dtype::Float32, Device::CPU, true);  // requires_grad=true
         std::copy(wpe_data.begin(), wpe_data.end(), wpe_t.data<float>());
         wpe = make_tensor(wpe_t, "wpe");
-        // Don't add to params_ - embeddings stay on CPU
+        params_.push_back(wpe);  // Add to trainable params
         
         mlp = new MLP(config);
         finall = new Linear(config.n_embd, config.vocab_size, Device::CPU);
@@ -329,42 +329,49 @@ public:
         return Value();
     }
 
-    // CPU embedding lookup - returns (B, T, C) tensor on GPU
-    Tensor embed_tokens(const Tensor& ids, const Value& embedding) {
-        Tensor ids_cpu = (ids.device().device != Device::CPU) ? ids.to(Device::CPU) : ids;
-        Tensor emb_cpu = (embedding.val().device().device != Device::CPU) ? embedding.val().to(Device::CPU) : embedding.val();
-        
-        int64_t B = ids.shape().dims[0];
-        int64_t T = ids.shape().dims[1];
-        int64_t C = emb_cpu.shape().dims[1];
+    // Autodiff-compatible embedding lookup using matmul with one-hot encoding
+    // Input: ids (B, T) as uint16, embedding Value (V, C)
+    // Output: Value (B*T, C) which will be reshaped to (B, T, C)
+    Value embed_with_matmul(const Tensor& ids, const Value& embedding, int64_t B, int64_t T) {
+        int64_t V = embedding.val().shape().dims[0];
+        int64_t C = embedding.val().shape().dims[1];
         int64_t N = B * T;
         
-        Tensor out_cpu = Tensor(Shape{{B, T, C}}, Dtype::Float32, Device::CPU);
-        float* out_ptr = out_cpu.data<float>();
-        const uint16_t* ids_ptr = ids_cpu.data<uint16_t>();
-        const float* emb_ptr = emb_cpu.data<float>();
-        int V = emb_cpu.shape().dims[0];
+        // Create one-hot encoding on CPU
+        Tensor ids_cpu = (ids.device().device != Device::CPU) ? ids.to(Device::CPU) : ids;
+        Tensor onehot = Tensor(Shape{{N, V}}, Dtype::Float32, Device::CPU);
+        float* oh_ptr = onehot.data<float>();
+        std::fill(oh_ptr, oh_ptr + N * V, 0.0f);
         
+        const uint16_t* ids_ptr = ids_cpu.data<uint16_t>();
         for (int64_t i = 0; i < N; ++i) {
             int idx = static_cast<int>(ids_ptr[i]);
-            if (idx < 0 || idx >= V) idx = 0;
-            const float* src = emb_ptr + idx * C;
-            float* dst = out_ptr + i * C;
-            std::copy(src, src + C, dst);
+            if (idx >= 0 && idx < V) {
+                oh_ptr[i * V + idx] = 1.0f;
+            }
         }
         
-        return out_cpu.to(Device::CUDA);
+        // Move one-hot to GPU
+        Tensor onehot_gpu = onehot.to(Device::CUDA);
+        Value onehot_val = make_tensor(onehot_gpu, "onehot");
+        
+        // Matmul: (N, V) @ (V, C) = (N, C)
+        Value emb_out = ag::matmul(onehot_val, embedding);
+        
+        return emb_out;
     }
 
     std::pair<Value, Value> forward(const Tensor& input_ids, const Tensor& target_ids) {
         int64_t B = input_ids.shape().dims[0];
         int64_t T = input_ids.shape().dims[1];
+        int64_t C = config.n_embd;
+        int64_t N = B * T;
 
-        // Get embeddings (on CPU, then move to GPU)
-        Tensor tok_emb = embed_tokens(input_ids, wte);
+        // Get token embeddings via autodiff-compatible matmul
+        Value tok_emb = embed_with_matmul(input_ids, wte, B, T);  // (B*T, C)
         
-        // Positional embeddings
-        std::vector<uint16_t> pos_data(B * T);
+        // Get positional embeddings
+        std::vector<uint16_t> pos_data(N);
         for(int b = 0; b < B; ++b) {
             for(int t = 0; t < T; ++t) {
                 pos_data[b * T + t] = t;
@@ -372,29 +379,28 @@ public:
         }
         Tensor pos_ids = Tensor(Shape{{B, T}}, Dtype::UInt16, Device::CPU);
         std::copy(pos_data.begin(), pos_data.end(), pos_ids.data<uint16_t>());
-        Tensor pos_emb = embed_tokens(pos_ids, wpe);
+        Value pos_emb = embed_with_matmul(pos_ids, wpe, B, T);  // (B*T, C)
         
-        // Add embeddings
-        Value x = make_tensor(tok_emb + pos_emb, "emb_sum");
+        // Add embeddings - stays 2D (B*T, C), connected to autodiff graph
+        Value x = ag::add(tok_emb, pos_emb);
 
         // Apply MLP blocks with residual connections
+        // Works with 2D (B*T, C) - Linear handles this correctly
         for(int i = 0; i < config.n_layers; ++i) {
             Value residual = x;
             Value m = (*mlp)(x);
             x = ag::add(residual, m);
         }
 
-        Value logits = (*finall)(x);
+        Value logits = (*finall)(x);  // (B*T, vocab_size)
 
         // Compute loss
         Value loss;
         if (target_ids.numel() > 0) {
             Tensor t = (target_ids.device().device != Device::CPU) ? target_ids.to(Device::CPU) : target_ids;
-
-            int64_t N = B * T;
             
-            // Create one-hot encoding
-            Tensor onehot = Tensor(Shape{{B, T, static_cast<int64_t>(config.vocab_size)}}, Dtype::Float32, Device::CPU);
+            // Create one-hot encoding for targets - flat (B*T, vocab_size)
+            Tensor onehot = Tensor(Shape{{N, static_cast<int64_t>(config.vocab_size)}}, Dtype::Float32, Device::CPU);
             float* oh_ptr = onehot.data<float>();
             std::fill(oh_ptr, oh_ptr + N * config.vocab_size, 0.0f);
 
@@ -450,11 +456,12 @@ float get_lr(int step, int warmup_steps, int max_steps, float max_lr, float min_
 
 int main() {
     try {
-        std::cout << "===== GPT-2 C++ Training (No PyTorch) =====\n";
+        std::cout << "===== GPT-2 MLP Training  =====\n";
         
         GPTConfig config;
+        const int global_batch = 16384;
         const int B = 4;
-        const int T = 256;
+        const int T = 1024;
         const std::string data_root = "/home/blubridge-035/Desktop/Backup/parallelism/script";
         
         cudaSetDevice(0);
@@ -473,7 +480,12 @@ int main() {
         std::vector<Value> all_params = model.parameters();
         Adam optimizer(all_params, config.max_lr, 0.9f, 0.95f, 1e-8f);
         
-        std::cout << "Starting training...\n" << std::endl;
+        // Calculate gradient accumulation steps
+        const int micro_batch_tokens = B * T;  // Tokens per micro-batch
+        const int grad_accum_steps = global_batch / micro_batch_tokens;
+        std::cout << "Gradient accumulation steps: " << grad_accum_steps << std::endl;
+        std::cout << "Micro-batch size: " << B << " x " << T << " = " << micro_batch_tokens << " tokens" << std::endl;
+        std::cout << "Global batch size: " << global_batch << " tokens\n" << std::endl;
         
         for (int step = 0; step < config.max_steps; ++step) {
             auto t0 = std::chrono::high_resolution_clock::now();
@@ -497,20 +509,38 @@ int main() {
                 std::cout << "validation loss: " << std::fixed << std::setprecision(4) << val_loss_accum << std::endl;
             }
             
-            // Training step
-            Batch batch = train_loader.next_batch();
-            auto result = model.forward(batch.input, batch.target);
-            Value logits = result.first;
-            Value loss = result.second;
-            
+            // Gradient accumulation training step
             optimizer.zero_grad();
-            ag::backward(loss);
+            float loss_accum = 0.0f;
             
+            for (int micro_step = 0; micro_step < grad_accum_steps; ++micro_step) {
+                Batch batch = train_loader.next_batch();
+                auto result = model.forward(batch.input, batch.target);
+                Value loss = result.second;
+                
+                // Backward accumulates gradients (they will be sum, not mean)
+                ag::backward(loss);
+                
+                // Accumulate loss for logging
+                Tensor l = loss.val().to_cpu();
+                loss_accum += l.data<float>()[0] / grad_accum_steps;
+            }
+            
+            // Scale gradients by 1/grad_accum_steps to get mean gradient
+            for (auto& p : all_params) {
+                if (p.node->requires_grad() && p.node->grad.numel() > 0) {
+                    p.node->grad *= (1.0f / static_cast<float>(grad_accum_steps));
+                }
+            }
+            
+            // Clip gradients after accumulation
             float norm = ag::clip_grad_norm_(all_params, 1.0f);
             
+            // Update learning rate
             float lr = get_lr(step, config.warmup_steps, config.max_steps, config.max_lr, config.min_lr);
             optimizer.set_alpha(lr);
             
+            // Optimizer step (once per global batch)
             optimizer.step();
             
             cudaDeviceSynchronize();
@@ -518,14 +548,11 @@ int main() {
             auto t1 = std::chrono::high_resolution_clock::now();
             double dt = std::chrono::duration<double>(t1 - t0).count();
             
-            int tokens_processed = B * T;
+            int tokens_processed = global_batch;
             double tokens_per_sec = tokens_processed / dt;
             
-            Tensor l = loss.val().to_cpu();
-            float loss_val = l.data<float>()[0];
-            
             std::cout << "step " << std::setw(5) << step 
-                      << " | loss: " << std::fixed << std::setprecision(6) << loss_val
+                      << " | loss: " << std::fixed << std::setprecision(6) << loss_accum
                       << " | lr " << std::scientific << std::setprecision(4) << lr
                       << " | norm: " << std::fixed << std::setprecision(4) << norm
                       << " | dt: " << std::fixed << std::setprecision(2) << (dt * 1000) << "ms"
