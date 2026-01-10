@@ -138,7 +138,7 @@ public:
                    const std::string& split,
                    const std::string& data_root,
                    bool master_process = true,
-                   size_t max_tokens_per_shard = 100000000)
+                   size_t max_tokens_per_shard = 102743040)
         : B_(B), T_(T),
           rank_(rank), world_(world_size),
           split_(split), root_(data_root),
@@ -235,15 +235,15 @@ private:
 // ============================================================================
 
 struct GPTConfig {
-    int context_length = 256;  // Reduced for testing
+    int context_length = 1024;  // Reduced for testing
     int vocab_size = 50304;
     int n_embd = 384;          // Reduced for testing
     int n_layers = 6;
 
-    float max_lr = 5e-4f;
-    float min_lr = 5e-5f;
-    int warmup_steps = 100;
-    int max_steps = 100;
+    float max_lr = 1e-4f;
+    float min_lr = 1e-5f;
+    int warmup_steps = 350;
+    int max_steps = 15000;
 };
 
 // ============================================================================
@@ -444,6 +444,10 @@ float get_lr(int step, int warmup_steps, int max_steps, float max_lr, float min_
     return min_lr + coeff * (max_lr - min_lr);
 }
 
+void _clear_all(Value& current_){
+    current_.val().reset();
+}
+
 // ============================================================================
 // Main Training Loop
 // ============================================================================
@@ -453,9 +457,9 @@ int main() {
         std::cout << "===== GPT-2 C++ Training (No PyTorch) =====\n";
         
         GPTConfig config;
-        const int B = 4;
-        const int T = 256;
-        const std::string data_root = "/home/blubridge-035/Desktop/Backup/parallelism/script";
+        const int B = 2;
+        const int T = 1024;
+        const std::string data_root = "/home/blu-bridge020/Code_Repos/MLP-Custom-Framework/data";
         
         cudaSetDevice(0);
         
@@ -475,8 +479,17 @@ int main() {
         
         std::cout << "Starting training...\n" << std::endl;
         
+        // Value logits;
+        // Value loss;
+        // std::pair<ag::Value, ag::Value> result = {};
+
         for (int step = 0; step < config.max_steps; ++step) {
             auto t0 = std::chrono::high_resolution_clock::now();
+
+            // logits = Value();
+            // loss = Value();
+            // result = {};
+
             bool last_step = (step == config.max_steps - 1);
             
             // Validation
@@ -499,7 +512,7 @@ int main() {
             
             // Training step
             Batch batch = train_loader.next_batch();
-            auto result = model.forward(batch.input, batch.target);
+            std::pair <ag::Value, ag::Value> result = model.forward(batch.input, batch.target);
             Value logits = result.first;
             Value loss = result.second;
             
@@ -532,7 +545,6 @@ int main() {
                       << " | tok/sec: " << std::fixed << std::setprecision(2) << tokens_per_sec
                       << std::endl;
         }
-        
         std::cout << "\nTraining complete!" << std::endl;
         
     } catch (const std::exception& e) {

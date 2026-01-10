@@ -26,6 +26,15 @@ make -j$(nproc)
 cd /home/blubridge-035/Desktop/Backup/parallelism/script
 
 g++ -O3 -std=c++20 gpt2_test.cpp -o gpt2_test \
+    -I/home/blu-bridge020/Code_Repos/MLP-Custom-Framework/cgadimpl/cgadimpl/include \
+    -I/home/blu-bridge020/Code_Repos/MLP-Custom-Framework/cgadimpl/tensor/include \
+    -I/usr/local/cuda/include \
+    -L/home/blu-bridge020/Code_Repos/MLP-Custom-Framework/cgadimpl/cgadimpl/build \
+    -L/home/blu-bridge020/Code_Repos/MLP-Custom-Framework/cgadimpl/tensor/lib \
+    -L/usr/local/cuda/lib64 \
+    -lcgadimpl -ltensor -lcudart -lpthread -ltbb -fopenmp
+
+g++ -O3 -std=c++20 gpt2_test.cpp -o gpt2_test \
     -I/home/blubridge-035/Desktop/Backup/parallelism/script/cgadimpl/cgadimpl/include \
     -I/home/blubridge-035/Desktop/Backup/parallelism/script/cgadimpl/tensor/include \
     -I/usr/local/cuda/include \
@@ -33,6 +42,7 @@ g++ -O3 -std=c++20 gpt2_test.cpp -o gpt2_test \
     -L/home/blubridge-035/Desktop/Backup/parallelism/script/cgadimpl/tensor/lib \
     -L/usr/local/cuda/lib64 \
     -lcgadimpl -ltensor -lcudart -lpthread -ltbb -fopenmp
+
 ```
 
 ### Option 2: Using CMake (recommended)
